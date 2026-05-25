@@ -24,10 +24,12 @@ Converts the ZIP output of the custom Figma Export Plugin directly into pixel-pe
 The Figma Export Plugin is responsible for geometry fidelity. D2C must consume `design.json` exactly as exported, without visual compensation.
 
 - **Coordinates**: `x` and `y` are relative to the JSON immediate parent. Do not apply manual offsets from screenshots or Figma.
+- **Layout authority**: If a parent has `layoutMode: "HORIZONTAL"` or `"VERTICAL"`, render its children as flex items using `padding`, `itemSpacing`, and alignment fields. Child `x/y` values may exist as exported Figma placement data, but do not absolute-position normal flex children unless that child has `layoutPositioning: "ABSOLUTE"`.
+- **Absolute containers**: If a parent has no `layoutMode`, render it as `position: relative` and place children with `position: absolute` using resolved `x/y` values. Missing `x` or `y` after `_ref` resolution means `0`.
 - **Asset placement**: For nodes with `asset`, `x`, `y`, `width`, and `height` are final CSS placement bounds. Complex image crops, rotations, and flips may already be baked into the exported PNG.
 - **Asset transform**: If an asset node has no `rotation`, do not add CSS `transform`. Only emit `transform: rotate(...)` when `rotation` is present in that same node.
 - **Images**: Render `asset` directly as `<img src="node.asset">` and map `objectFit` to `object-fit`. Do not reinterpret Figma image crop data; the exporter has already resolved it.
-- **Templates / `_ref`**: `_ref` nodes may reuse the template DOM structure, but their own `x`, `y`, `width`, and `height` are authoritative. Never inherit template geometry or fabricate missing geometry.
+- **Templates / `_ref`**: Treat `_ref` as deterministic delta compression: resolve it as `template + overrides` before generating HTML. Missing fields inherit from the matching `_templateId`; fields present on the `_ref` node override the template. Do not infer values from screenshots.
 - **Validation tools**: Export-plugin audit or regression scripts are allowed during plugin development, but they are not part of this D2C skill. The `NO SCRIPTS` rule still applies when generating `index.html`.
 
 ---
@@ -49,10 +51,15 @@ Read `<project_dir>/skeleton.txt`. It gives you the UI tree structure, dimension
 Before looking at `design.json`, note these data conventions:
 - **Colors**: Are pre-computed as HEX (`"#RRGGBB"`). If alpha exists (`"#RRGGBBAA"`), convert to `rgba(R, G, B, A/255)` for CSS.
 - **Removed fields**: `svgContent`, `assetType`, `{r,g,b,a}` objects, and non-root `absoluteX`/`absY` are no longer in the payload. Do not look for them!
-- **Deduplication**: Nodes with `_templateId` are source templates. Nodes with `_ref` may reuse the template DOM structure, but their own geometry and overrides (`x`, `y`, `width`, `height`, `content`, `color`, `asset`, `objectFit`) remain authoritative. If a `_ref` node lacks required geometry, follow `AGENTS.md`: skip it and record the deviation.
+- **Deduplication**: Nodes with `_templateId` are source templates. Nodes with `_ref` are compressed nodes. Resolve them mechanically:
+  1. Find the source node whose `_templateId` equals `_ref`.
+  2. Deep-copy the template node.
+  3. Apply every field present on the `_ref` node as an override, including explicit `x: 0` or `y: 0`, plus `id`, `name`, `content`, `width`, `height`, `color`, `segments`, `asset`, `objectFit`, `children`, and style fields.
+  4. Use the resolved node as the only source for HTML/CSS.
+  If the template is missing, skip the node and record a deviation. If the resolved node still lacks fields required for its type, record an export issue instead of guessing.
 
 ### 4. Read `design.json`
-Read `design.json` (section by section if large), matching it against the skeleton. View `assets/reference.png` to anchor your understanding visually. Do not start coding until your mental model is complete.
+Read `design.json` (section by section if large), matching it against the skeleton. Build a mechanical mental model from `design.json` only. `assets/reference.png` is for final validation, not for deriving missing positions, sizes, colors, or layout rules.
 
 ---
 
@@ -76,7 +83,8 @@ Convert the skeleton into HTML containers.
 - Write the hierarchy, dimension (`width`, `height`), and `display: flex`.
 - `[H]` → `display:flex; flex-direction:row`
 - `[V]` → `display:flex; flex-direction:column`
-- `[ABS]` → `position:relative` (and its children get `position:absolute`)
+- `[ABS]` / nodes without `layoutMode` → `position:relative` (children get `position:absolute`)
+- `[H]` / `[V]` children stay in flex flow unless their own `layoutPositioning` is `ABSOLUTE`
 - Address scrolling: Fixed headers (`top:0; z-index:10`), Scrollable bodies (`overflow-y:auto`), Fixed Footers (`bottom:0`).
 
 ### Pass B: Style Population
@@ -90,7 +98,8 @@ Add visual properties from `design.json` onto the framework:
 - **Typography & Segments**: Map `fontSize`, `lineHeight`, `fontName.style` (`400/500/600/700`). Render `segments[]` as `<span>` tags with inline overrides.
 - **Images**: Map `asset` to `<img src="...">` and `objectFit` to `object-fit`. Use the node's exported `x/y/width/height` directly. If `rotation` is absent, do not add CSS transforms.
 - **Interactive Elements**: Only add `cursor: pointer` & `:hover` states if an `interactions` object explicitly exists.
-- **Templates / Overrides (`_ref`)**: Duplicate the HTML block of the `_templateId` only for structure, then substitute the unique fields supplied by the `_ref` node directly inline. Do not inherit template position or size.
+- **Templates / Overrides (`_ref`)**: First resolve `_ref` nodes using `template + overrides`, then generate HTML/CSS from the resolved node. Inherited template values are allowed only through this deterministic resolution step; never choose values by visual estimation.
+- **Child placement**: In absolute containers, apply resolved `left/top`. In flex containers, do not apply `left/top` to normal children; use flex ordering, padding, gap, and alignment instead.
 
 ---
 
@@ -122,11 +131,11 @@ For every `❌`, immediately apply the fix to `index.html` and update the table 
 1. Serve the UI: `python3 -m http.server 8080 &`
 2. Wait 2 seconds. Use the browser subagent to visit `http://localhost:8080`.
 3. Wait for network idle. Capture a screenshot of the root container.
-4. Visually compare the screenshot against `assets/reference.png`. Look strictly for:
+4. Visually compare the screenshot against `assets/reference.png`. Use this only to validate the result, not to invent missing source values. Look strictly for:
    - Flex direction / Wrapping / Gap mismatches.
    - Wrong Z-indexes / Overlaps.
    - Assets failing to load / Incorrect scale.
    - Text rendering issues.
 5. Provide a **Deviation Checklist** of everything observed.
-6. Fix all items on the checklist in a **single editing pass**. Note any unresolved issues due to browser layout constraints.
+6. Fix only items that trace to a clear mapping mistake between `design.json` and `index.html` in a **single editing pass**. If the mismatch is caused by missing/incorrect export data, record it as an export issue instead of adding magic offsets or inferred CSS.
 7. End the workflow. Do NOT take another screenshot or loop.
